@@ -1,0 +1,185 @@
+# =============================================================================
+# NexHub iOS 打包工作流 —— 只构建 iOS（不碰其他平台）
+# 产物：无签名构建 + ldid 伪签名 → TrollStore 可直接安装的 IPA
+# 触发：push 到 main / 打 v* 标签 / 手动 Run workflow
+# =============================================================================
+name: Build iOS IPA (TrollStore)
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+# 同一 ref 只跑一次（iOS 构建慢，避免重复浪费 macOS 分钟数）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios-trollstore:
+    name: Build Runner.app → ldid → IPA
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Flutter (stable 3.47.0)
+        # 与 build.yml 四平台一致用 3.47.0，已验证可用
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.0'
+          channel: stable
+          cache: true
+
+      - name: Show Flutter / Xcode versions
+        run: |
+          flutter --version
+          xcodebuild -version
+          sw_vers
+
+      - name: Install ldid
+        # Saurik 的 ldid：ad-hoc 伪签名（TrollStore 接受）
+        run: brew install ldid
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: 生成多语言文件 (gen-l10n)
+        run: |
+          flutter gen-l10n 2>&1
+          echo "== generated l10n files =="
+          ls -la lib/generated 2>&1 || true
+          grep -n "class AppLocalizations" lib/generated/app_localizations.dart 2>&1 || true
+
+      - name: 重新生成启动图标 (flutter_launcher_icons)
+        # flutter_launcher_icons 不会在 flutter build 时自动重跑，
+        # 显式生成保证 iOS 图标基于源图最新产出
+        run: flutter pub run flutter_launcher_icons 2>&1 || dart run flutter_launcher_icons 2>&1
+
+      - name: Static analysis (errors only)
+        # 只把 error 当失败：仓库既有 info 级 lint（风格）不应阻塞构建。
+        # 放在 Xcode 构建之前，几秒内拦住类型错误（避免浪费 20+ 分钟 iOS 构建）。
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib
+
+      - name: Disable Swift Package Manager (media_kit 需要)
+        # media_kit_libs_ios_video / media_kit_video 不支持 Swift Package Manager，
+        # Flutter 3.44+ 默认 SPM 接管 iOS 依赖会硬错误。必须全局禁用。
+        run: flutter config --no-enable-swift-package-manager
+
+      - name: Build iOS (no codesign)
+        # Secrets 缺失（如 fork PR）时 dart-define 为空字符串，不阻断构建
+        run: |
+          flutter build ios \
+            --release \
+            --no-codesign \
+            --no-tree-shake-icons \
+            --dart-define=DANMAKU_APP_ID=${{ secrets.DANMAKU_APP_ID }} \
+            --dart-define=DANMAKU_APP_SECRET=${{ secrets.DANMAKU_APP_SECRET }} \
+            --dart-define=BANGUMI_CLIENT_ID=${{ secrets.BANGUMI_CLIENT_ID }} \
+            --dart-define=BANGUMI_CLIENT_SECRET=${{ secrets.BANGUMI_CLIENT_SECRET }}
+
+      - name: Locate Runner.app
+        id: locate
+        run: |
+          set -e
+          APP_PATH=$(find build/ios/iphoneos -maxdepth 2 -name "*.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ .app not found"
+            find build/ios -name "*.app" -type d || true
+            exit 1
+          fi
+          APP_NAME=$(basename "$APP_PATH" .app)
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "📦 App bundle: $APP_PATH"
+          ls -la "$APP_PATH"
+
+      - name: Strip original code signature
+        run: |
+          APP_PATH=${{ steps.locate.outputs.APP_PATH }}
+          rm -rf "$APP_PATH/_CodeSignature"
+          rm -f  "$APP_PATH/embedded.mobileprovision"
+          echo "✅ Stripped original signature"
+
+      - name: Pseudo-sign with ldid
+        # ldid -S = ad-hoc 伪签名（TrollStore 接受）
+        # 主可执行 + 所有 framework/xcframework slice/dylib 都要签
+        run: |
+          set -e
+          APP_PATH=${{ steps.locate.outputs.APP_PATH }}
+          APP_NAME=${{ steps.locate.outputs.APP_NAME }}
+          APP_EXEC="$APP_PATH/$APP_NAME"
+          echo "=== Signing main executable: $APP_EXEC ==="
+          ldid -S "$APP_EXEC"
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            for FRAMEWORK in "$APP_PATH/Frameworks/"*.framework; do
+              if [ -d "$FRAMEWORK" ]; then
+                FW_NAME=$(basename "$FRAMEWORK" .framework)
+                FW_EXEC="$FRAMEWORK/$FW_NAME"
+                if [ -f "$FW_EXEC" ]; then
+                  ldid -S "$FW_EXEC"
+                  echo "✅ Signed framework: $FW_NAME"
+                fi
+              fi
+            done
+            for XCFRAMEWORK in "$APP_PATH/Frameworks/"*.xcframework; do
+              if [ -d "$XCFRAMEWORK" ]; then
+                for SLICE in "$XCFRAMEWORK"/*/; do
+                  if [ -d "$SLICE" ]; then
+                    FW_NAME=$(basename "$SLICE" .framework)
+                    FW_EXEC="$SLICE$FW_NAME"
+                    if [ -f "$FW_EXEC" ]; then
+                      ldid -S "$FW_EXEC"
+                      echo "✅ Signed xcframework slice: $FW_NAME"
+                    fi
+                  fi
+                done
+              fi
+            done
+            for DYLIB in "$APP_PATH/Frameworks/"*.dylib; do
+              if [ -f "$DYLIB" ]; then
+                ldid -S "$DYLIB"
+                echo "✅ Signed dylib: $(basename "$DYLIB")"
+              fi
+            done
+          fi
+          for BIN in "$APP_PATH/"*.dylib "$APP_PATH/"*.so; do
+            if [ -f "$BIN" ]; then
+              ldid -S "$BIN"
+              echo "✅ Signed: $(basename "$BIN")"
+            fi
+          done
+
+      - name: Package IPA
+        id: ipa
+        run: |
+          set -e
+          APP_PATH=${{ steps.locate.outputs.APP_PATH }}
+          mkdir -p build/ipa
+          TEMP_DIR=$(mktemp -d)
+          mkdir -p "$TEMP_DIR/Payload"
+          cp -R "$APP_PATH" "$TEMP_DIR/Payload/"
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          IPA_NAME="nexhub-ios-${SHORT_SHA}.ipa"
+          cd "$TEMP_DIR"
+          zip -r -q -X "$GITHUB_WORKSPACE/build/ipa/${IPA_NAME}" Payload
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$TEMP_DIR"
+          echo "IPA_PATH=build/ipa/${IPA_NAME}" >> "$GITHUB_OUTPUT"
+          ls -lh build/ipa/
+          echo "✅ IPA created: $IPA_NAME"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexhub-ios-trollstore
+          path: build/ipa/*.ipa
+          retention-days: 30
+          if-no-files-found: error
